@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Image Receipts
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket
+  TableName:
+    Type: String
+    Description: Name of the DynamoDB table
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt Lambda.Arn
+
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs12.x
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: !Sub
+          - |
+            const AWS = require("aws-sdk");
+            const rekognition = new AWS.Rekognition();
+            const db = new AWS.DynamoDB();
+
+            exports.handler = async (event) => {
+              const bucketName = event.Records[0].s3.bucket.name;
+              const objectKey =  event.Records[0].s3.object.key;
+              
+              const receiptData = await extractTextFromImage(bucketName, objectKey);
+              await writeToDB(receiptData);
+
+              return "OK from Lambda";
+            }
+
+            async function writeToDB(data){
+              const params = {
+                  Item: {
+                      "auth": {
+                          N: data.receiptAuth
+                      },
+                      "paidAt": {
+                          S: data.receiptDate
+                      },
+                      "total": {
+                          S: data.receiptTotal
+                      }
+                  },
+                  TableName: "${TableName}"
+              }
+              return db.putItem(params).promise();
+            }
+
+            async function extractTextFromImage(Bucket, Name){
+              const params = {
+                  Image: {
+                      S3Object: { Bucket, Name }
+                  }
+              }
+              const receiptArray = await rekognition.detectText(params).promise();
+              const detections = receiptArray.TextDetections;
+              
+              const receiptDate = detections[4].DetectedText.match(/^\S+/)[0];
+              const receiptTotal = detections[11].DetectedText.slice(1);
+              const receiptAuth = detections[13].DetectedText.match(/\d{4}/)[0];
+              
+              return { receiptDate, receiptTotal, receiptAuth };
+            }
+          - TableName: !Ref TableName
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Lambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${BucketName}
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: S3Read
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+        - PolicyName: LogWrite
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: DynamoWrite
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt DDBTable.Arn
+        - PolicyName: RekognitionDetectText
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectText
+                Resource: "*"
+  DDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      AttributeDefinitions:
+        - AttributeName: "auth"
+          AttributeType: "N"
+        - AttributeName: "paidAt"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "auth"
+          KeyType: "HASH"
+        - AttributeName: "paidAt"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
